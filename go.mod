@@ -1,4 +1,4 @@
-module github.com/arandu-io/package-skeleton
+module github.com/hyz-is/arandu-token
 
 go 1.26.10
 
