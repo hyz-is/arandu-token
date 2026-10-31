@@ -3,9 +3,11 @@ package unit_test
 import (
 	"go/ast"
 	"go/build/constraint"
+	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -13,39 +15,29 @@ import (
 // What this package proves about itself, before anybody installs it.
 //
 // `aru doctor` audits the application it is run inside. It walks that project's
-// own tree, skips vendor/, reads the one arandu.mod.toml at its root, and
-// refuses a directory that is not an application at all. It never loads a
+// own tree, reads the one arandu.mod.toml at its root, and never loads a
 // dependency. So nothing an installed package does is audited by the
-// application that installed it: a package that reached a table without a
-// Grant, took a tenant out of a request, or declared no capabilities and then
-// opened a socket would pass every check the installer runs.
+// application that installed it, and whatever this one must prove about itself
+// it proves here or nowhere.
 //
-// The package is therefore the only place that check can happen, and this is
-// it. These tests read this package's own Go files as syntax and hold four
-// properties:
+// These tests read the package's own Go files as syntax and hold the properties
+// a credential store lives by:
 //
-//  1. every exported Service method calls Authorize before it reaches the
-//     generated query;
-//  2. the tenant comes from the Grant, and nothing a request carried is read as
-//     one;
-//  3. the Model remains tenant-scoped and CRUD does not grow a second data path;
-//  4. what arandu.mod.toml declares is what the code does.
+//  1. what arandu.mod.toml declares is what the code does;
+//  2. a token leaves the package through one door, Secret.Reveal, called in one
+//     place;
+//  3. nothing here logs, prints or formats on its own, so no token can be
+//     written by a line somebody forgot;
+//  4. no statement is handed a token: the store receives digests;
+//  5. no address is read from a header the client writes.
 //
-// The fifth is held where the routes exist rather than here, because a prefix
-// arrives through configuration and syntax cannot follow it:
-// TestNoRouteLandsInTheFrameworkNamespace, in tests/Feature/routes_test.go,
-// registers the module and reads the table back.
-//
-// What these tests do not reach is worth as much as what they do. They read
-// syntax: a call hidden behind an interface, a wrapper around the named Model
-// entry point, and anything reached by reflection are all invisible to them. A
-// green run means no such thing was found written down, not that none exists.
-// What is absolute is what the compiler holds alongside them -- a Model terminal
-// with no Grant in its call does not compile.
+// What they do not reach is worth as much as what they do. They read syntax: a
+// call hidden behind an interface and anything reached by reflection are
+// invisible to them. A green run means no such thing was found written down, not
+// that none exists. The behaviour is held by the feature tests, which drive a
+// whole life of tokens through a real database and look for them in every
+// output.
 
-// buildable reports whether the compiler ever reads this file.
-//
-// It asks the build constraint rather than the file name, so a file excluded by
 // a tag is left out of the audit whatever it is called: what the compiler never
 // builds is not part of what the package does, and reporting it as such would
 // be reporting a capability nobody can reach.
@@ -139,108 +131,60 @@ func firstCallTo(body *ast.BlockStmt, name string) token.Pos {
 	return found
 }
 
-// TestEveryServiceMethodAuthorizesBeforeTheModel holds the mandatory path on
-// every exported use case rather than on the three that exist today.
+// TestAnAccessTokenLeavesThroughOneDoor holds that the only call of Reveal in
+// the package is the one that builds the body of the answer, in secret.go.
 //
-// A nil-database denial test proves the closed path. This syntax audit is its
-// twin for an allowed path: Model construction is visible in the method body,
-// and moving it above Authorize fails even when no terminal is executed.
-func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
+// Reveal is how a Secret becomes a string. Anywhere else it is called, the
+// string can be put in an error, a statement or a log line.
+func TestAnAccessTokenLeavesThroughOneDoor(t *testing.T) {
 	t.Parallel()
 
-	audited := 0
-	for _, source := range auditedFiles(t) {
-		for _, declaration := range source.file.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil || receiverType(function) != "TokenService" ||
-				!function.Name.IsExported() {
-				continue
-			}
-			audited++
-
-			decided := firstCallTo(function.Body, "Authorize")
-			reach := firstModelReach(function.Body)
-			if decided == token.NoPos {
-				t.Errorf("%s: %s never calls security.Authorize, so no Policy decided whether the Model may run",
-					source.path, function.Name.Name)
-			}
-			if reach == token.NoPos {
-				t.Errorf("%s: %s never reaches the generated query, so this audit found no data boundary to order",
-					source.path, function.Name.Name)
-			}
-			if decided != token.NoPos && reach != token.NoPos && decided > reach {
-				t.Errorf("%s: %s reaches the Model before security.Authorize",
-					source.path, function.Name.Name)
-			}
-		}
-	}
-	if audited == 0 {
-		t.Fatal("no exported TokenService method was found, so this test proved nothing")
-	}
-}
-
-// firstModelReach is where a Service first constructs the generated query or
-// calls a promoted write terminal. Tokens itself counts: moving only its
-// construction before Authorize is the mutation this audit exists to reject.
-func firstModelReach(body *ast.BlockStmt) token.Pos {
-	terminals := map[string]bool{
-		"Save": true, "Delete": true, "Restore": true, "Touch": true,
-	}
-	found := token.NoPos
-	ast.Inspect(body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		name := calledName(call)
-		if name != "Tokens" && !terminals[name] {
-			return true
-		}
-		if found == token.NoPos || call.Pos() < found {
-			found = call.Pos()
-		}
-		return true
-	})
-	return found
-}
-
-// requestAccessors are the ways a value that arrived with the request is read.
-// A tenant taken through any of them is a tenant the caller chose.
-var requestAccessors = map[string]bool{
-	"Param":         true,
-	"Query":         true,
-	"Input":         true,
-	"FormValue":     true,
-	"PostFormValue": true,
-	"PathValue":     true,
-	"Cookie":        true,
-	"Get":           true,
-}
-
-// TestNoTenantIsReadOutOfTheRequest is the rule with no exception in it. A
-// tenant the client can name is a client who chooses whose rows they read, and
-// every other check in the package passes while it happens.
-func TestNoTenantIsReadOutOfTheRequest(t *testing.T) {
-	t.Parallel()
-
+	revealed := 0
 	for _, source := range auditedFiles(t) {
 		ast.Inspect(source.file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
-			if !ok {
+			if !ok || calledName(call) != "Reveal" {
 				return true
 			}
-			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !requestAccessors[selector.Sel.Name] {
-				return true
+			revealed++
+			if source.path != "secret.go" {
+				t.Errorf("%s calls Reveal: a token becomes a string only in secret.go", source.path)
 			}
-			for _, argument := range call.Args {
-				literal, ok := argument.(*ast.BasicLit)
-				if !ok || literal.Kind != token.STRING {
-					continue
+			return true
+		})
+	}
+	if revealed == 0 {
+		t.Fatal("no call of Reveal was found, so this test proved nothing")
+	}
+}
+
+// TestNothingInThePackageLogsPrintsOrReadsAHeaderOfTheClient holds that the
+// production code writes to no logger and no stream, and takes the address of a
+// request from RemoteAddr alone.
+func TestNothingInThePackageLogsPrintsOrReadsAHeaderOfTheClient(t *testing.T) {
+	t.Parallel()
+
+	forbidden := map[string]bool{
+		"fmt.Print": true, "fmt.Printf": true, "fmt.Println": true,
+		"fmt.Fprint": true, "fmt.Fprintf": true, "fmt.Fprintln": true,
+		"log.Print": true, "log.Printf": true, "log.Println": true,
+		"log.Fatal": true, "log.Fatalf": true, "log.Panic": true, "log.Panicf": true,
+		"slog.Debug": true, "slog.Info": true, "slog.Warn": true, "slog.Error": true,
+		"slog.Log": true, "println": true, "print": true,
+	}
+	for _, source := range auditedFiles(t) {
+		standard := standardImports(source.file)
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.CallExpr:
+				if name := qualifiedName(node, standard); forbidden[name] {
+					t.Errorf("%s calls %s: this package writes to no log and no stream, so no token can be written by it", source.path, name)
 				}
-				if strings.Contains(strings.ToLower(literal.Value), "tenant") {
-					t.Errorf("%s: %s(%s) reads a tenant out of the request; it comes from the Grant, which came from the session",
-						source.path, selector.Sel.Name, literal.Value)
+			case *ast.BasicLit:
+				if strings.EqualFold(strings.Trim(node.Value, `"`), "X-Forwarded-For") ||
+					strings.EqualFold(strings.Trim(node.Value, `"`), "X-Real-IP") ||
+					strings.EqualFold(strings.Trim(node.Value, `"`), "Forwarded") {
+					t.Errorf("%s reads %s, which the client writes: the address comes from RemoteAddr", source.path, node.Value)
 				}
 			}
 			return true
@@ -248,45 +192,79 @@ func TestNoTenantIsReadOutOfTheRequest(t *testing.T) {
 	}
 }
 
-// TestTheServiceWritesTenantOnlyFromTheGrant holds the write half of tenant
-// isolation. The proposed value is policy input; the value persisted after
-// Authorize must take TenantID directly from data.Tenant(g).
-func TestTheServiceWritesTenantOnlyFromTheGrant(t *testing.T) {
+// TestNoStatementIsHandedAToken holds that no argument of a database call is a
+// variable named for a token. What the store receives is a digest, and the
+// variables that hold one are named for that.
+func TestNoStatementIsHandedAToken(t *testing.T) {
 	t.Parallel()
 
-	audited := 0
+	statements := map[string]bool{"exec": true, "ExecContext": true, "QueryContext": true, "QueryRowContext": true, "byDigest": true}
+	tokens := map[string]bool{"token": true, "access": true, "refresh": true, "raw": true, "bearer": true}
+	checked := 0
 	for _, source := range auditedFiles(t) {
-		for _, declaration := range source.file.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil || receiverType(function) != "TokenService" {
-				continue
-			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				assignment, ok := node.(*ast.AssignStmt)
-				if !ok {
-					return true
-				}
-				for i, target := range assignment.Lhs {
-					if i >= len(assignment.Rhs) || selectorName(target) != "TenantID" {
-						continue
-					}
-					audited++
-					call, ok := assignment.Rhs[i].(*ast.CallExpr)
-					if !ok || calledName(call) != "Tenant" {
-						t.Errorf("%s: %s writes TenantID from something other than data.Tenant(g)",
-							source.path, function.Name.Name)
-					}
-				}
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || !statements[calledName(call)] {
 				return true
-			})
-		}
+			}
+			checked++
+			for _, argument := range call.Args {
+				ast.Inspect(argument, func(inner ast.Node) bool {
+					if identifier, ok := inner.(*ast.Ident); ok && tokens[identifier.Name] {
+						t.Errorf("%s hands %q to %s: the store keeps digests, never tokens", source.path, identifier.Name, calledName(call))
+					}
+					return true
+				})
+			}
+			return true
+		})
 	}
-	if audited == 0 {
-		t.Fatal("no Service tenant assignment was found, so this test proved nothing")
+	if checked == 0 {
+		t.Fatal("no database call was found, so this test proved nothing")
 	}
 }
 
-// capabilities is what arandu.mod.toml declares, and what the code does, under
+// TestThePackageIsComposedByHand holds that nothing in it is a service
+// provider, a container or a global registry.
+func TestThePackageIsComposedByHand(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range auditedFiles(t) {
+		for _, imported := range source.file.Imports {
+			path := strings.Trim(imported.Path.Value, `"`)
+			if strings.Contains(path, "/container") {
+				t.Errorf("%s imports the container surface %s", source.path, path)
+			}
+		}
+		for _, declaration := range source.file.Decls {
+			switch declaration := declaration.(type) {
+			case *ast.FuncDecl:
+				name := declaration.Name.Name
+				if declaration.Recv == nil && (name == "init" || strings.Contains(name, "Provider") || name == "Register") {
+					t.Errorf("%s declares %s, which makes composition implicit", source.path, name)
+				}
+			case *ast.GenDecl:
+				if declaration.Tok != token.VAR {
+					continue
+				}
+				for _, spec := range declaration.Specs {
+					value, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, name := range value.Names {
+						if name.Name == "_" || strings.HasPrefix(name.Name, "Err") || strings.HasPrefix(name.Name, "err") ||
+							strings.HasSuffix(name.Name, "Pattern") || name.Name == "identifier" {
+							continue
+						}
+						t.Errorf("%s declares the package variable %s: a mutable global is a hidden registry", source.path, name.Name)
+					}
+				}
+			}
+		}
+	}
+}
+
 // the same four names.
 type capabilities struct {
 	network    bool
@@ -497,4 +475,53 @@ func qualifiedName(call *ast.CallExpr, standard map[string]string) string {
 		return name + "." + selector.Sel.Name
 	}
 	return owner.Name + "." + selector.Sel.Name
+}
+
+// packageRoot is the directory of the module.
+func packageRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("finding package root")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+type parsedGoFile struct {
+	path string
+	file *ast.File
+}
+
+// productionGoFiles parses every Go file of the module that is not a test or
+// generated view, comments kept because a build constraint is one.
+func productionGoFiles(t *testing.T, root string) []parsedGoFile {
+	t.Helper()
+
+	files := []parsedGoFile{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "testdata" || entry.Name() == "tests") {
+			return filepath.SkipDir
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") ||
+			strings.HasSuffix(entry.Name(), "_test.go") || strings.HasSuffix(entry.Name(), ".kyse.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ParseComments)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, parsedGoFile{path: filepath.ToSlash(relative), file: file})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reading production Go files: %v", err)
+	}
+	return files
 }

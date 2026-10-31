@@ -66,12 +66,12 @@ func releasedChangelog(t *testing.T) string {
 // went out undocumented. It is the cheapest signal of that, and it needs no git
 // history to read.
 func TestEveryActionIsNamedInAReleasedChangelogEntry(t *testing.T) {
-	policy := readReleaseFile(t, packageRoot(t), "policy.go")
+	policy := readReleaseFile(t, packageRoot(t), "actions.go")
 	released := releasedChangelog(t)
 
 	names := regexp.MustCompile(`(?m)^\t([A-Z][A-Za-z]*) security\.Action = `).FindAllStringSubmatch(policy, -1)
 	if len(names) == 0 {
-		t.Fatal("policy.go declares no actions")
+		t.Fatal("actions.go declares no actions")
 	}
 	for _, name := range names {
 		if !strings.Contains(released, "`"+name[1]+"`") {
