@@ -15,16 +15,16 @@ names the situation you are in rather than the topic it covers.
 
 | skill | when it fires |
 | --- | --- |
-| `token-policy` | opening an action, adding an authorized Model-backed use case, or anything answering 403 |
-| `token-module` | adding a route, a handler, a config field, a response field or a migration |
+| `token-secrecy` | anything that touches a `Secret`, a `Pair`, an error message, a log line, an `Event`, or a test that prints a token |
+| `token-module` | adding a service call, a config field, a column, a migration, an event, or changing the middleware or the throttle |
 | `token-release` | the gates, the manifest, a dependency, a version, a tag |
 | `token-vault-notes` | writing the note, the gap or the journal entry, when this checkout sits inside the Arandu Obsidian vault |
-| `token-package` | installing and wiring this package **into an application** |
+| `token-package` | installing and wiring this package **into an application**, and using it there |
 
-The last one has a different audience from the other three, and that is on
+The last one has a different audience from the other four, and that is on
 purpose: it travels with the package so that an assistant working in somebody
 else's project — the one running `go get` — has the wiring, the migration step
-and the closed policy in front of it instead of guessing.
+and the rules about tokens in front of it instead of guessing.
 
 Its frontmatter says so, under `metadata`, with `audience: app`. That line is
 what `aru skills:sync` reads to copy the skill into an application whose
@@ -33,28 +33,4 @@ application that received the release procedure would follow it.
 
 `token-vault-notes` fires on a condition rather than on a task: it applies
 only when `MOC-arandu.md`, `plans/cmd/audit-vault/` and `45-modules/` are actually
-beside this checkout. Outside the vault it is inert, and it says so first, so a
-package cloned somewhere else never grows a folder tree imitating one.
-
-## Why these exist
-
-The audience of the first three is somebody changing the package. The common
-failure modes are a provider, a container lookup, a hand edit to the generated
-`TokenQuery.go`, a rule of the entity written into the Service instead of the
-custom block of `model.go`, a handler that loads the session or maps an error to
-a status itself, a CRUD Repository beside the Model, a tenant read from the URL,
-or a Policy branch that returns nil for administrators "for now". None belongs
-here, and the last three are security failures rather than style disagreements.
-
-The package is built to be checked rather than trusted. Its denial tests use a
-nil database, so reaching even the generated query constructor before
-authorization panics. The structural twin reads every exported Service method
-and checks the same order on the allowed path, and reads every handler for the
-subject and the status it must leave to the framework. Running
-`go test -race ./...` exercises all of it.
-
-## Adding your own
-
-A skill in this directory is yours and travels with the repository. Keep it a
-procedure rather than a description: a file that says "read the documentation"
-never changes what anybody does.
+beside this checkout, and says to stop when they are not.

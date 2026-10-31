@@ -18,46 +18,35 @@ The two filters on `gofmt` are not preference. `gofmt` is the only tool in the
 chain that ignores build tags, so it reads files the compiler deliberately
 excludes; `testdata/` holds fixtures that are invalid on purpose.
 
-A change to the entity in `model.go` is followed by `aru model:build`, which
-rewrites `TokenQuery.go`, and the regenerated file goes in the same commit.
-`aru model:build --check` exits 1 when the committed file is missing, stale or
-edited by hand.
+The feature tests also run on PostgreSQL when `ARANDU_TEST_POSTGRES_DSN` names a
+server, and a change that touches a statement or the schema is not finished until
+they pass there as well.
 
 ## What a change has to keep true
 
-Four properties are the reason this package is what it is. A change that breaks
-one of them will not be merged, whatever else it improves.
+Six properties are the reason this package is what it is. A change that breaks
+one of them will not be merged, whatever else it improves. AGENTS.md lists them
+with the test that holds each.
 
-1. **The policy denies by default.** No branch allows every action, and none is
-   added. Opening an action means writing the rule that opens it.
-2. **Every Service method authorizes before reaching the Model.** The Grant is
-   then required by the Model terminal; constructing `Tokens(db)` first is
-   already the wrong order and the structural audit rejects it.
-3. **The tenant comes from `data.Tenant(g)`.** Not from the path, the body, the
-   query string or a header, on any code path, including the read paths.
-4. **`arandu.mod.toml` matches the code.** Adding an outbound call, a file
-   write or a process means declaring it there in the same commit.
+1. **Only the digest is stored.** A token is shown once, in the `Pair` that issues
+   it. It is not in a table, an error, a log line, `String()`, `LogValue` or a
+   JSON that is not the body `Pair.Reveal` builds.
+2. **A refresh token is good once.** Reusing an exchanged one revokes that
+   device's session, and of two simultaneous exchanges exactly one wins.
+3. **A user reaches nothing of another's.** Every call that acts on devices
+   takes the user it acts on and filters by it.
+4. **The workspace is a candidate.** The module never decides a tenant of data.
+5. **The credentials table is cleaned.** A table that only grows is a defect.
+6. **`arandu.mod.toml` matches the code.** Adding an outbound call, a file write
+   or a process means declaring it there in the same commit.
 
-CRUD stays on `Tokens(db)` and its generated query. Add a Repository only for
-a specialized complex query, read model, report, export or raw SQL contract; a
-wrapper around `Find`, `Get`, `Save` or `Delete` is a second data path.
+A statement is written in `service.go` and nowhere else. It takes digests, never
+tokens, and every instant it writes is UTC to the microsecond. A change to the
+schema is a new migration with a new name; a published migration is never
+edited.
 
-Every query starts at `Tokens(s.db)`. The constructor returns one mutable
-query, so a second chain begun from a value held in a variable carries the
-clauses of the first -- and that compiles.
-
-Model-backed entities stay pointers. A copy of `Token` keeps the model of the
-row it was copied from, and the model refuses to write through the copy with
-`model.ErrUnwired`. Response resources are the deliberate snapshot boundary;
-Service results are not.
-
-The rules of the entity itself go in the custom block of `model.go`, as pure
-methods. The Service orchestrates, and holds no rule the entity could hold.
-
-Handlers read who is asking with `ctx.User()`, which `RequireAuth` filled, and
-return the error the Service returned for the router to answer. A handler that
-loads the session or maps an error to a status fails
-`TestHandlersLeaveTheSubjectAndTheStatusToTheFramework`.
+Do not add a route, a user, a password check or a log line. They are the
+application's, and the tests that refuse them say why.
 
 ## Style
 

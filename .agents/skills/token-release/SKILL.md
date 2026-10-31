@@ -37,26 +37,18 @@ whatever happens to be checked out beside you.
 project: no go.mod, main.go and arandu.toml together"* — it reads applications,
 and this is a library.
 
-`aru model:build` is different: it works on a module root, and it is what wrote
-`TokenQuery.go`. Run it after any change to the entity, and before a release
+This package has no generated model: its statements are written in `service.go`,
+so there is no `aru model:build` step. The feature tests also run on PostgreSQL
+when `ARANDU_TEST_POSTGRES_DSN` names a server, and a release is cut only after
+they have passed there as well:
 
 ```sh
-aru model:build --check
+ARANDU_TEST_POSTGRES_DSN='postgres://paulorlima9@localhost:5432/arandu_token_test?sslmode=disable' \
+  go test -race -count=1 ./...
 ```
 
-which writes nothing and exits 1 when the generated file is missing, stale or
-edited by hand. It needs the `aru` binary rather than the Go toolchain alone,
-which is why it sits beside the four gates and not among them.
-
-CI runs the same four, and so does the release workflow on the tagged archive.
-Both also run `go vet configure.go` by name while their template sections are
-still in them, because the build tag on that file keeps it out of `./...`.
-
-The template has two build subjects, and both are release gates: the raw clone
-and a clean copy after `configure.go` substitutes every name. Run build, vet,
-and race on both. Preserve a built configurator long enough to invoke it again
-inside the configured copy; it must refuse and the tree hash must be identical
-before and after that refusal.
+CI runs the same four gates, and so does the release workflow on the tagged
+archive.
 
 ## What the manifest declares, and who reads it
 
@@ -67,7 +59,7 @@ opened by nothing but that package's own suite.
 
 ```toml
 name = "hyz-is/token"
-framework = ">= 0.66"
+framework = ">= 0.67"
 profiles = ["conventional", "performance"]
 
 [permissions]
@@ -95,8 +87,8 @@ own code; here both fail the suite, because `go test` has one outcome:
 | `permission-not-used` | warning | the manifest says `true` and nothing does it. Asking for more than you need is how a permission model erodes into everyone declaring everything |
 
 So a dependency or a call added here is a line changed in `arandu.mod.toml` in
-the same commit. `migrations = true` is the one this package already declares,
-and it is what tells an installer to run `aru migrate` before deploying.
+the same commit. `migrations = true` is the one this package declares, and it is what tells an
+installer to run `aru migrate` before deploying.
 
 The `framework` line is a floor, and it is a second declaration of something
 `go.mod` already says. Move both together when you bump.
@@ -129,7 +121,7 @@ has shipped.
 Before tagging:
 
 - the four gates pass with `GOWORK=off`;
-- `aru model:build --check` finds nothing to change;
+- the tests pass on PostgreSQL as well as on SQLite;
 - `arandu.mod.toml` matches the code;
 - `CHANGELOG.md` has the entry, under the version, in the Keep a Changelog
   sections — `Added`, `Changed`, `Fixed`, `Removed`.
@@ -142,11 +134,9 @@ it is, and what they have to write instead.
 
 Run `apidiff` against the release baseline and enumerate every removal; the CI
 step named `api diff against the last release` fails unless `UPGRADE.md` names
-each one. A move to a new shape of the model breaks more than its own
-signatures: `Tokens` changing what it returns is one line, and every method
-the old embedded model promoted on `*Token` that the new one does not is
-another, each named on its own. Keeping `ErrNotFound` in `model.go` is not a
-removal just because its value changed.
+each one. A change to the shape of `Config`, `Pair`, `Device`, `Event` or
+`Principal` breaks every struct literal of the application that writes one, and
+each field that goes is named on its own.
 
 Three changes break an installer without touching a signature, and each one is
 worth a line in the changelog:

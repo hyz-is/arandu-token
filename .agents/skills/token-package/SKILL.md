@@ -1,6 +1,6 @@
 ---
 name: token-package
-description: Install, wire and use the Arandu Token package (Go, Arandu) in an application. Use when the request is to "install Arandu Token", "add token to the app", "go get github.com/hyz-is/arandu-token", "wire it into bootstrap/app.go", "register the module", "use the token routes", "everything under /token returns 403", "403 forbidden from token", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-token. Covers the three lines of wiring and where each one goes, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Install, wire and use the Arandu Token package (Go, Arandu) in an application, to authenticate a native app with a token per person and per device. Use when the request is to "install Arandu Token", "add token auth to the app", "go get github.com/hyz-is/arandu-token", "wire it into bootstrap/app.go", "register the module", "sign in a native app", "issue a token", "refresh token", "sign out a device", "list the user's devices", "switch workspace in the app", "protect the app login from guessing", "Authorization Bearer", "the table does not exist", or when a project's go.mod already requires github.com/hyz-is/arandu-token. Covers the wiring and where it goes, the Config fields, the calls and what the application still owns, revalidating the Membership on every request, and the migration step that is not optional.
 license: MIT
 metadata:
   audience: app
@@ -8,10 +8,15 @@ metadata:
 
 # Using Arandu Token
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
+Authentication of native apps: an access token and a refresh token per person and
+per device, with rotation and revocation. It is registered by hand: there is no
+service provider, no container and no discovery, so if a line is not written in
+the application, it does not happen.
+
+It registers **no route**. The sign-in, the refresh and the sign-out are the
+application's own endpoints, because they check the application's passwords and
+answer in the application's shape. The module issues, exchanges, resolves and
+revokes; it does not know users and never decides the tenant of data.
 
 ## Install
 
@@ -19,166 +24,83 @@ happen.
 go get github.com/hyz-is/arandu-token
 ```
 
-## The three lines of wiring, and where each one goes
+## The wiring, and where it goes
 
-All three are in `bootstrap/app.go`. Nothing else in the application changes,
-and `aru make:module` does not edit this file for you.
-
-The import, with the other module imports:
+All of it is in `bootstrap/app.go`. `aru make:module` does not edit this file.
 
 ```go
-import (
-	token "github.com/hyz-is/arandu-token"
-)
-```
+import token "github.com/hyz-is/arandu-token"
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
-
-```go
-	tokenModule, err := token.New(token.Config{}, db, sessions)
+	tokenModule, err := token.New(token.Config{
+		AccessPrefix:  "myapp_a_", // readable, and the application's own
+		RefreshPrefix: "myapp_r_",
+		Events:        auditTokens(activity), // optional: a token.Recorder
+	}, db)
 	if err != nil {
 		return App{}, err
 	}
+	k.Register(tokenModule)
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
-
-```go
-		tokenModule,
-```
-
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
-
-## Then run the migrations
+Then once, before the application serves:
 
 ```bash
 aru migrate
 ```
 
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
+The module owns `token_credentials` and `token_devices`, and schedules a daily
+clean of what expired. If the tables are not there, `Health` says so and points
+at `aru migrate`.
 
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
+## The calls, all on `tokenModule.Service()`
 
-**Symptom to recognise:** `no such table`, or `relation does not exist`, from a
-route that authorized correctly. The migration has not run.
+- `Issue(ctx, userID, workspaceID, token.Device{ID, Name, Platform})` after the
+  application verified the password and the second factor, and that the user
+  belongs to the workspace. `Pair.Reveal()` is the body to send.
+- `Refresh(ctx, refresh)`; `ErrInvalidToken` and `ErrReuseDetected` are 401. A
+  reuse has already revoked the device's session.
+- `Switch(ctx, access, workspaceID)` after the application checked the
+  Membership.
+- `Revoke(ctx, token)` for a sign-out, `RevokeDevice(ctx, userID, deviceID)` for a
+  user removing a device, `RevokeAllForUser(ctx, userID)` after a password
+  change or a suspension.
+- `ListDevices(ctx, userID)`. The application decides who may ask about whose
+  devices; the module acts on the user it is given.
+- `token.Guard(ctx, throttle, scope, identity, client, check)` around the check
+  of credentials, with `token.NewLimiter(token.LimiterPolicy{})` or the
+  framework's `auth.NewMemoryThrottle()`.
 
-## Configuration
+Put the request's address on the context with
+`token.WithClientIP(ctx, token.RemoteIP(r))` before `Issue`, `Refresh`, `Switch`
+and the revocations; `RequireToken` does it itself.
 
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/token` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
-
-`token.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
-
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
-
-## Routes
-
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/token` | `token.index` |
-| `GET` | `/token/{id}` | `token.show` |
-| `POST` | `/token` | `token.store` |
-
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `HX-Redirect` for an htmx
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
-
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
-
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
-
-`GET /token` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`TokenPolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
+## Authenticating requests
 
 ```go
-	// arandu:begin custom
-	if a == TokenView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
+	subjectFor := func(ctx context.Context, p token.Principal) (security.Subject, error) {
+		subject, err := workspaces.SubjectFor(ctx, p.UserID, p.WorkspaceID) // revalidates the Membership
+		if errors.Is(err, workspace.ErrNotAMember) {
+			return security.Subject{}, token.ErrUnknownToken // 401
+		}
+		return subject, err
 	}
-	// arandu:end custom
+	api := r.Group("/api", tokenModule.Service().RequireToken(subjectFor))
 ```
 
-What is not written there stays closed, including every action added later.
-There are five actions — `TokenView`, `TokenList`, `TokenCreate`,
-`TokenUpdate`, `TokenDelete` — and opening one opens exactly one.
+The workspace in the principal is a **candidate**. Revalidate it on every request;
+the Grant comes from `security.Authorize` on the Subject, and the tenant of data
+from `data.Tenant(g)`. Never use `p.WorkspaceID` as a tenant.
 
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
+## Do not
 
-## What the answers mean
-
-| status | what happened |
-| --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
-| `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
-
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not htmx) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
-
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
-
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
-
-## Reporting a problem
-
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-token`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
-
-MIT licensed. Copyright HYZIS.
+- Do not `Println`, log or marshal a `Pair`, a `Secret` or an error with a token
+  in it. They print `[redacted]`; `Pair.Reveal()` is the only door.
+- Do not store the token, or compare it: store nothing, or its digest
+  (`token.DigestOf`).
+- Do not read the address from `X-Forwarded-For`; use `token.RemoteIP` behind the
+  trusted-proxy middleware.
+- Do not call `Refresh` from several requests at once in the client. With the
+  default configuration the second one signs the device out; serialise it, or set
+  `Config.ReuseGrace`.
+- Do not use the `Limiter` behind several instances and expect one budget; give
+  `Guard` a shared-store throttle there.

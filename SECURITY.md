@@ -25,21 +25,28 @@ unless you ask not to be.
 
 ## What is in scope
 
-Anything that lets a caller reach data a policy did not authorize. In
-particular:
+Anything that lets a caller act as somebody it is not, or keeps acting after it
+should not be able to. In particular:
 
-- a path from a handler to a Model or database handle that does not pass through
-  the Service and its Policy;
-- a route reachable without `RequireAuth`, or a handler that takes who is
-  asking from anywhere but the subject the guard put on the request;
-- a Model terminal reached before `security.Authorize`;
-- a query whose tenant scope is disabled, or a tenant taken from anywhere but
-  `data.Tenant(g)`;
-- a `Grant` that can be produced without a policy returning nil;
-- a field reaching a response that `Resource` does not list.
+- a token, or the random part of one, that reaches a table, an error, a log
+  line, a `String()` or `LogValue`, or a JSON other than `Pair.Reveal`;
+- a way to use a refresh token twice without the session being revoked, or an
+  exchange in which two simultaneous callers both win;
+- a token that still resolves after it expired, was revoked, was rotated, or
+  after its session was switched to another workspace;
+- a call that acts on a device or a session of a user other than the one it was
+  given, including the same device identifier on two accounts;
+- a way to make the module decide a tenant of data, or to put a principal on a
+  context without the middleware;
+- a way to make the throttle forget a lockout in force, or to grow its table
+  without bound;
+- an address taken from a header the client writes.
 
 ## What is not
 
 - A vulnerability in the framework itself. Report that to the framework.
-- A policy that is too permissive in an application that opened it. What this
-  package ships denies everything; what an application opens is its own.
+- An application that does not revalidate the Membership in its `SubjectFunc`, or
+  that lets a user list or revoke the devices of another. The module takes the
+  user it acts on from its caller; who may ask is the application's.
+- A sign-in throttle used behind several instances without a shared store. The
+  `Limiter` lives in one process and says so.

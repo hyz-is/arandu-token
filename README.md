@@ -4,8 +4,31 @@
 
 # Arandu Token
 
-An Arandu package. It registers its own routes, owns its own table, and decides
-for itself who may reach either.
+Authentication of native apps for an Arandu application: a token per person and
+per device, with renewal and revocation.
+
+A device signs in with whatever the application asks of it, and the application
+calls `Issue`. The device gets two opaque tokens: a short-lived **access** token
+it sends as `Authorization: Bearer` on every request, and a long-lived
+**refresh** token it exchanges for the next pair. A refresh token is good once.
+Presenting one that was already exchanged is taken for theft and revokes that
+device's whole session.
+
+The store keeps the SHA-256 digest of each token and never the token. A token is
+shown once, in the `Pair` that issues it, and no log line, error, `String()`,
+`slog` value or JSON of this package carries one.
+
+## What it is not
+
+It does not know users. It stores an identifier, never checks a password or a
+second factor, and registers no route: the sign-in, the refresh and the sign-out
+of a native app are the application's own endpoints, because they check the
+application's passwords and answer in the application's shape.
+
+It never decides the tenant of data. The workspace kept beside a token is a
+**candidate**. The application revalidates the Membership on every request, with
+`WorkspaceService.SubjectFor` or whatever it calls it, and only then issues the
+Grant. The tenant of data comes from `data.Tenant(g)` and from nowhere else.
 
 ## Install
 
@@ -27,20 +50,27 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
+The construction, in `Build`, after the database handle exists and before
+`k.Register`. The prefixes are the application's own: a credential found in a log
+or a repository then says whose it is, and a secret scanner can match it.
 
 ```go
-	tokenModule, err := token.New(token.Config{}, db, sessions)
+	tokenModule, err := token.New(token.Config{
+		AccessPrefix:  "alpra_",
+		RefreshPrefix: "alprr_",
+		AccessTTL:     15 * time.Minute,    // the default
+		RefreshTTL:    60 * 24 * time.Hour, // the default
+		Events:        auditTokens(activity),
+	}, db)
 	if err != nil {
 		return App{}, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
+And the registration, inside the `k.Register(...)` calls already there:
 
 ```go
-		tokenModule,
+	k.Register(tokenModule)
 ```
 
 Then, once, before the application serves:
@@ -49,184 +79,243 @@ Then, once, before the application serves:
 aru migrate
 ```
 
-This package owns a table, which is why the migration step is not optional and
-why `arandu.mod.toml` says `migrations = true`.
+The module owns two tables, `token_credentials` and `token_devices`, which is why
+the migration step is not optional and why `arandu.mod.toml` says
+`migrations = true`. It registers a daily task that deletes what expired, so
+`Config.CleanSpec` moves it and `token.CleanDisabled` turns it off for an
+application that calls `Service.Clean` itself.
 
-## Publish the views
+## The API
 
-This package carries the markup of its own pages and hands it over instead of
-rendering it from the inside, because a page you cannot edit is a page that says
-the wrong thing in your product.
+All of it is on `tokenModule.Service()`.
 
-Look at what would be written, then write it:
+| call | what it does |
+| --- | --- |
+| `Issue(ctx, userID, workspaceID, device) (Pair, error)` | Signs a device in. A device has one session: signing in again on it ends the previous one. `workspaceID` may be empty for a session bound to none yet. |
+| `Refresh(ctx, refresh) (Pair, error)` | Exchanges a refresh token for a new pair and the old one stops working. A refresh token already exchanged is a reuse: the whole session is revoked, `EventReuseDetected` is recorded, and the answer is `ErrReuseDetected`. |
+| `Resolve(ctx, digest) (Principal, bool, error)` | Who a valid access token was issued to. `ok` is false for a token that was never issued, expired, was revoked or is a refresh token. The error is for the store failing, which is not a 401. |
+| `Switch(ctx, access, workspaceID) (Pair, error)` | Moves the session to another workspace: the old pair is revoked and a new one is issued. The application checks the Membership first. |
+| `Revoke(ctx, token) error` | A device signing out, with its access or its refresh token. Idempotent. |
+| `RevokeDevice(ctx, userID, deviceID) error` | The user removing one of their devices. `ErrNotFound` for a device that is not theirs. |
+| `RevokeAllForUser(ctx, userID) (int, error)` | Every session of the user: a password change, a suspension, "sign out everywhere". |
+| `ListDevices(ctx, userID) ([]Device, error)` | Devices with a live session: name, platform, last use and last address. |
+| `Clean(ctx) (Cleaned, error)` | Deletes expired and revoked credentials older than `Config.Retention`. |
+| `RequireToken(subjectFor)` | Middleware for `Authorization: Bearer`. |
+| `Resolver(subjectFor)` | The framework's `middleware.TokenResolver`, for an application that mounts `middleware.RequireToken` itself. |
 
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-```
+`Device` is `{ID, Name, Platform}`: the install the native app signs in from.
+`ID` is generated once by the app and sent on every sign-in; it is scoped to the
+user, so the same value on two accounts is two devices.
 
-Nothing is written without `--apply`. The preview lists every file as `create`,
-`update`, `unchanged` or `conflict`, and running the command a second time
-writes nothing. A file changed outside its `arandu:begin custom` markers is
-reported as a conflict and left alone; `--force` publishes over one, and even
-then what is inside the markers is carried forward.
+### Signing in
 
-The files land under `resources/views/modules/token/`, and from that point
-they are yours. Nothing of this package is compiled beside them, so no view name
-is registered twice and no rule has to decide which of two files won — the
-consequence being that a view of this package that changes later does not reach
-a project that already published it.
-
-Two steps are left to you, and they are left to you because a command that
-edited `bootstrap/app.go` behind your back is a command whose output nobody can
-explain. Compile what was written:
-
-```bash
-aru view:build
-```
-
-and import the directory it wrote into, with the other imports:
+The application checks the password and the second factor, then issues:
 
 ```go
-	_ "your/module/path/storage/framework/views/modules/token"
+func (c *Auth) Login(ctx *fhttp.Context) error {
+	reqCtx := token.WithClientIP(ctx.Ctx(), token.RemoteIP(ctx.Request))
+
+	err := token.Guard(reqCtx, c.throttle, "app", email, token.RemoteIP(ctx.Request),
+		func(context.Context) (bool, error) { return c.users.Verify(reqCtx, email, password, code) })
+	if err != nil {
+		return err // ErrBadCredentials is 401, a LockedError is 429 with Retry-After
+	}
+
+	user, workspace, err := c.workspaces.Default(reqCtx, email) // the Membership the user starts in
+	if err != nil {
+		return err
+	}
+	pair, err := c.tokens.Issue(reqCtx, user.ID, workspace.ID, token.Device{
+		ID: ctx.Input("device_id"), Name: ctx.Input("device_name"), Platform: ctx.Input("platform"),
+	})
+	if err != nil {
+		return err
+	}
+	return ctx.JSON(http.StatusCreated, pair.Reveal())
+}
 ```
 
-Without that import the views are not in the binary, and the module refuses to
-boot rather than answering the first request that reaches one of them with a
-500. The refusal names the view, the command and the import.
+`pair.Reveal()` is the one place the tokens leave the package: marshalling it
+writes `token_type`, `access_token`, `refresh_token`, `expires_in`,
+`access_expires_at`, `refresh_expires_at`, `workspace_id` and `device_id`.
+Formatting or logging a `Pair`, or the `Revealed` it returns, prints
+`[redacted]`; marshalling a `Pair` writes `"[redacted]"` for each token.
+
+### Authenticating requests
+
+`SubjectFunc` is where the application revalidates the Membership. The workspace
+in the principal is a candidate; the function answers the Subject scoped to the
+workspace it found, with the roles and actions the permission module gives it
+there, or `token.ErrUnknownToken` when the user no longer belongs:
+
+```go
+	subjectFor := func(ctx context.Context, p token.Principal) (security.Subject, error) {
+		subject, err := workspaces.SubjectFor(ctx, p.UserID, p.WorkspaceID)
+		if errors.Is(err, workspace.ErrNotAMember) {
+			return security.Subject{}, token.ErrUnknownToken // a 401, as for a token nobody issued
+		}
+		return subject, err // any other error is a 500, not a 401
+	}
+
+	api := r.Group("/api", tokenModule.Service().RequireToken(subjectFor))
+```
+
+Behind it a handler reads who is asking with `ctx.User()` exactly as it does
+behind `RequireAuth`, and `token.PrincipalFrom(ctx.Ctx())` adds the device. The
+Grant comes from `security.Authorize` on that Subject, as on any request.
+
+A request with no token, a token nobody issued, one that expired or was revoked,
+or whose `SubjectFunc` says `ErrUnknownToken`, is answered the same 401 with
+`WWW-Authenticate: Bearer`. The token is read from the header and from nowhere
+else. The address of the request comes from `RemoteAddr` and never from a header
+the client writes, so behind a proxy the application's trusted-proxy middleware
+has to have rewritten it.
+
+An application that prefers the framework's own middleware uses
+`middleware.RequireToken(tokenModule.Service().Resolver(subjectFor))`; it gets the
+same answers, without the device on the context.
+
+### Renewing
+
+```go
+func (c *Auth) Refresh(ctx *fhttp.Context) error {
+	reqCtx := token.WithClientIP(ctx.Ctx(), token.RemoteIP(ctx.Request))
+	pair, err := c.tokens.Refresh(reqCtx, ctx.Input("refresh_token"))
+	if err != nil {
+		return err // ErrInvalidToken and ErrReuseDetected are both 401
+	}
+	return ctx.JSON(http.StatusOK, pair.Reveal())
+}
+```
+
+A client that refreshes from two requests at once sends the same token twice,
+and with the default configuration the second is a reuse and signs the device
+out. Serialise the refresh in the client, or set `Config.ReuseGrace` to a few
+seconds: a reuse inside it is refused as `ErrInvalidToken` and revokes nothing.
+The price is those seconds of exposure.
+
+### Switching workspace
+
+```go
+	pair, err := c.tokens.Switch(reqCtx, bearer, workspaceID)
+```
+
+The application first checks that the user belongs to `workspaceID`. The new pair
+replaces the old one, refresh token included.
+
+### Protecting the sign-in
+
+A native app has no Turnstile. `token.Guard` runs the check of credentials behind
+any `SignInThrottle`, the interface of the framework's `auth.MemoryThrottle`:
+
+```go
+	throttle, err := token.NewLimiter(token.LimiterPolicy{}) // or auth.NewMemoryThrottle()
+```
+
+`Limiter` counts two budgets in one indivisible step, the **account** across all
+addresses (5 by default) and the **address** across all accounts (25), and the
+attempt that spends one locks the key: 30 seconds the first time, doubling each
+time it locks again within a day, up to an hour. A refused attempt costs nothing,
+so hammering a locked account does not extend it. A good sign-in forgets the
+account and gives the address one unit back. The table is bounded and it starts
+no goroutine.
+
+It lives in the memory of one process. Behind several instances the budgets
+multiply by the number of instances, and an application that runs more than one
+gives `Guard` a throttle backed by a shared store.
+
+### Recording what happened
+
+`Config.Events` receives `token.issued`, `token.refreshed`, `token.reuse_detected`,
+`token.revoked` and `token.switched`, with the user, workspace, device, session,
+reason, address and time, and never a token or a digest. It runs **inside the
+transaction of the act**, so a recorder that writes with the application's
+database handle joins it, and an error from the recorder fails the act. Writing
+them to `arandu-activitylog`:
+
+```go
+func auditTokens(logger *activitylog.Logger) token.Recorder {
+	return token.RecorderFunc(func(ctx context.Context, e token.Event) error {
+		//arandu:system-grant the event is about a session of this workspace; the entry is written under it.
+		g := security.SystemGrant("token.audit", e.WorkspaceID)
+		_, err := logger.Activity(ctx, g).
+			OnRef(activitylog.Ref{Type: "user", ID: e.UserID}).
+			Event(string(e.Kind)).
+			WithProperties(map[string]any{"device_id": e.DeviceID, "reason": e.Reason, "ip": e.IP}).
+			Log(string(e.Kind))
+		return err
+	})
+}
+```
+
+A session with no workspace yet has no tenant for a Grant, so the application
+decides where those entries go.
 
 ## Configuration
 
-| field | required | meaning |
+| field | default | meaning |
 | --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/token`. |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200. |
+| `AccessPrefix` | `tka_` | readable start of an access token. |
+| `RefreshPrefix` | `tkr_` | readable start of a refresh token. It differs from the other, and neither starts the other. |
+| `AccessTTL` | 15 minutes | at most 24 hours. |
+| `RefreshTTL` | 60 days | counted from the token that rotated into it; at least `AccessTTL`, at most 400 days. |
+| `Retention` | 7 days | how long expired and revoked credentials stay. It is also how long an exchanged refresh token is recognised as a reuse. |
+| `ReuseGrace` | 0 | seconds after an exchange in which the old token is refused without revoking the session. At most 2 minutes. |
+| `TouchInterval` | 1 minute | least time between two writes of a token's last use and its device's last address. Negative writes on every request. |
+| `CleanSpec` | `17 3 * * *` | cron of the scheduled clean; `token.CleanDisabled` for none. |
+| `Events` | nil | the `Recorder`. |
+| `Clock` | `time.Now` | for tests. |
 
-The zero `Config{}` is a valid configuration. There is no tenant to set: every
-route needs a session, and the tenant of every statement is the one on the
-Grant of whoever is signed in.
+The zero `Config{}` is a valid configuration. `New` returns an error rather than
+starting half-wired.
 
-`New` returns an error rather than starting half-wired, so a setting that
-cannot work fails where it is written instead of on the first request that
-needed it.
+## Tables
 
-## Routes
+| table | holds |
+| --- | --- |
+| `token_credentials` | `digest` (unique), `kind` (`access` or `refresh`), `family_id`, `user_id`, `workspace_id`, `device_id`, `expires_at`, `last_used_at`, `revoked_at`, `revoked_reason`, `created_at`. One row per token; a sign-in's pairs share a `family_id`. |
+| `token_devices` | `user_id` + `device_id` (unique), `name`, `platform`, `last_ip`, `last_used_at`, `created_at`, `updated_at`. |
 
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/token` | `token.index` |
-| `GET` | `/token/{id}` | `token.show` |
-| `POST` | `/token` | `token.store` |
-
-Every one of them sits behind `RequireAuth`: a visitor with no session is sent
-to `/auth/login`, and the handler of a request that has one reads who is asking
-with `ctx.User()`. Behind the guard, every route is refused until the policy is
-opened. That is the state the package ships in, and it is deliberate.
-
-A handler returns the error the service returned, and the router answers it: a
-policy refusal is 403, a record that is not there is 404, and a rejected input
-goes back where it came from with the messages in the flash. A request that asks
-for JSON gets the same statuses as `application/problem+json` documents, and a
-rejected input as a 422 with the messages keyed by field. No handler maps an
-error to a status itself.
-
-## Open the policy
-
-`policy.go` denies every action and has no branch that allows one. Open what
-this package needs, one action at a time, inside the custom block:
-
-```go
-	// arandu:begin custom
-	if a == TokenView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
-
-## The data path
-
-`Token` embeds `model.Model`, and `tokenTable`, beside it in `model.go`,
-declares its table once. `aru model:build` generates `TokenQuery.go` from
-it: `Tokens(db)`, which starts a `*TokenQuery`, and `TokenCollection`.
-The file is committed and never edited by hand; regenerate it after changing
-the entity, and `aru model:build --check` fails when it is out of date.
-
-`TokenService` owns `*data.DB` and follows
-`validate -> security.Authorize -> Grant -> Model terminal`; handlers never hold
-the database or start a query. Every query starts at `Tokens(s.db)`: the
-constructor returns one mutable query, so a second chain begun from a value held
-in a variable would carry the clauses of the first.
-
-Create builds the row with `Tokens(s.db).New()` and writes `TenantID` from
-`data.Tenant(g)`. Find authorizes before reading and again against the row it
-found. List authorizes before building its scoped, allowlisted query. The table
-keeps its default `tenant_id` scope on every terminal.
-
-Terminals return `*Token` and `[]*Token`. Keep those pointers: a copy of a
-row keeps the model of the original, and the model refuses to write through it
-with `model.ErrUnwired`. `Resource` and `Collection` are explicit response
-snapshots and do not expose tenant or Model internals.
-
-The rules of the entity itself — an invariant, a derived value, a transition
-such as `Rename` guarded by `CanRename` — go in the custom block of `model.go`,
-as pure methods: no database, no network, no clock read inside, no Grant. The
-service orchestrates: it validates, authorizes, calls those rules and saves
-with the Grant.
-
-There is no CRUD Repository. Add one only for a complex query, read model,
-report, export or raw SQL contract that the generated query cannot express.
+They carry the package's name so that they sit beside a `devices` or `tokens`
+table the application already has.
 
 ## Layout
 
 ```
-module.go         registration, routes, handlers and migrations
-config.go         what the application passes in
-model.go          the entity, its table and its own rules, and what it may answer with
-TokenQuery.go  the query aru model:build generates from model.go
-policy.go         who may do what
-service.go        the use cases, and Model access after authorization
-views.go          the files the application takes ownership of
+module.go    registration, schedule, health and migrations
+config.go    what the application passes in
+service.go   issue, refresh, resolve, switch, revoke, list and clean
+http.go      the Bearer middleware and the context helpers
+limiter.go   the throttle for sign-in, with a progressive lockout
+secret.go    Secret, Pair and Revealed: tokens that do not print
+events.go    what the application records
+errors.go    the errors, each with the status the router answers it
+model.go     Device, Principal, Digest and the validation of identifiers
+actions.go   the one action the schedule runs under
 ```
 
-## What is already correct, and has to stay that way
+## Why the service reads its tables without a Grant
 
-**The policy denies everything.** There is no permit-all branch to delete
-later. The Service calls `security.Authorize` before its first `Tokens(db)`
-reach, and every Model terminal requires the Grant that call produced.
-
-**Authorization precedes the Model.** The package audit checks that order in
-every exported Service method. A Model terminal enforces tenant scope; the
-preceding Policy call decides whether the action itself is allowed.
-
-**The tenant comes from `data.Tenant(g)`.** Never from the path, the body, the
-query string or a header. The value on the Grant came from the session; a value
-that arrived with the request is a value the caller chose.
-
-**Who is asking comes from the guard.** `RequireAuth` loads the session once and
-puts the subject on the request; nothing in the module loads it again.
-
-**`arandu.mod.toml` declares what the package does** — network, filesystem,
-exec, migrations — and the suite compares the declaration against what the code
-*calls*, not against what it imports: `net/http` is imported by everything with
-a route and says nothing. A package that says it makes no outbound calls and
-then opens one fails its own tests, and that is the only place the comparison
-happens. `aru doctor` audits the application it is run inside and never loads a
-dependency, so nothing audits an installed package except the package itself.
+Every other module reaches its rows through a Grant, because a row belongs to a
+tenant and the Grant names it. A credential cannot work that way: the question
+`Resolve` answers is who is asking, which comes before any Grant exists, and the
+only thing the caller holds is the token. hesape's session store reads its table
+the same way, keyed by the secret and by nothing else. Nothing here decides a
+tenant of data; the Grant that does is issued by the application afterwards.
 
 ## Tests
 
 ```bash
+export GOWORK=off
 go test -race ./...
 ```
 
-The denial suite constructs the Service with a nil database, so even building
-`Tokens(nil)` would panic. The structural twin reads the allowed path and
-rejects any Service method that reaches the Model before `Authorize`, and any
-handler that loads the session or picks a status itself. The route tests drive
-the module with no session, with a signed-in subject and with a rejected input,
-on that same handle over no database.
+The feature tests run on SQLite, and also on PostgreSQL when
+`ARANDU_TEST_POSTGRES_DSN` names a server; each test gets a schema of its own.
+
+```bash
+ARANDU_TEST_POSTGRES_DSN='postgres://user@localhost:5432/arandu_token_test?sslmode=disable' go test -race ./...
+```
 
 ## Licence
 
