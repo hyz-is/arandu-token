@@ -6,16 +6,18 @@
 # four lines below worth reading before installing anything.
 
 name = "hyz-is/token"
-framework = ">= 0.66"
+framework = ">= 0.67"
 profiles = ["conventional", "performance"]
 
 [permissions]
-# It answers requests and reads its own rows. Nothing leaves the process.
+# It answers the application's calls and reads its own rows. Nothing leaves the
+# process.
 network = false
 # It keeps no state outside the database.
 filesystem = false
 # It runs no other program.
 exec = false
-# module.go owns the tokens table, so whoever installs this has to run
-# `aru migrate`. Declaring it is how they find that out before deploying.
+# module.go owns the token_credentials and token_devices tables, so whoever
+# installs this has to run `aru migrate`. Declaring it is how they find that
+# out before deploying.
 migrations = true
