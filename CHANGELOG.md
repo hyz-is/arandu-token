@@ -10,6 +10,19 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-19
+
+### Added
+
+- The migration `20261119_0001_widen_token_time_precision`: every instant of
+  `token_credentials` (`expires_at`, `last_used_at`, `revoked_at`, `created_at`)
+  and `token_devices` (`last_used_at`, `created_at`, `updated_at`), which a
+  database migrated before Hesape v0.67.0 holds in whole seconds -- PostgreSQL
+  rounds a value to the second there, MySQL truncates it -- are raised to
+  microseconds through Hesape's `migrations.WidenTimePrecision`. A column
+  already in microseconds is left alone, SQLite has nothing to widen, and the
+  rollback keeps the columns wide.
+
 ## [0.1.0] - 2026-10-31
 
 The first release: authentication of native apps with a token per person and per

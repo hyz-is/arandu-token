@@ -63,7 +63,8 @@ func TestTheModuleDeclaresWhatItOwns(t *testing.T) {
 		t.Fatal("no service")
 	}
 	all := m.Migrations()
-	if len(all) != 1 || all[0].GetName() != "20261031_0001_create_token_tables" {
+	if len(all) != 2 || all[0].GetName() != "20261031_0001_create_token_tables" ||
+		all[1].GetName() != "20261119_0001_widen_token_time_precision" {
 		t.Fatalf("migrations = %v", all)
 	}
 	if _, ok := all[0].(migrations.ReversibleMigration); !ok {

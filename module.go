@@ -135,7 +135,21 @@ func (m *Module) Health(ctx context.Context) error {
 // They are returned in the order their names sort in, which is the order they
 // apply in: the name carries the order, and nothing else decides it.
 func (m *Module) Migrations() []foundation.Migration {
-	return []foundation.Migration{createTokenTables{}}
+	return []foundation.Migration{createTokenTables{}, widenTokenTimePrecision()}
+}
+
+// widenTokenTimePrecision raises the instants of both tables to microseconds
+// where an earlier framework default created them in whole seconds, which
+// PostgreSQL rounds a value to and MySQL truncates it to: a credential read
+// back did not expire, get used or get revoked at the instant it was written,
+// and the comparison with a clock that carries fractions went wrong at the
+// edge. A column already in microseconds is left alone, SQLite has nothing to
+// widen, and the rollback keeps the columns wide.
+func widenTokenTimePrecision() migrations.WidenTimePrecision {
+	return migrations.WidenTimePrecision{
+		Name:   "20261119_0001_widen_token_time_precision",
+		Tables: []string{credentialsTable, devicesTable},
+	}
 }
 
 // The migration is reversible, and the assertion is here rather than discovered
