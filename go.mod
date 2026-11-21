@@ -3,8 +3,8 @@ module github.com/hyz-is/arandu-token
 go 1.26.10
 
 require (
-	github.com/arandu-io/framework v0.67.0
-	github.com/arandu-io/hesape v0.89.2
+	github.com/arandu-io/framework v0.71.0
+	github.com/arandu-io/hesape v0.109.0
 	github.com/arandu-io/hesape/database/connectors/pgx v0.11.0
 	github.com/arandu-io/hesape/database/connectors/sqlite v0.11.0
 )
